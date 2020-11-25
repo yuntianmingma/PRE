@@ -7,6 +7,9 @@ from umbral import pre,keys,signing,config,params,kfrags,cfrags
 import os
 from socket import *
 import pickle
+from hexbytes import HexBytes
+import requests
+import json
 import threading
 
 config.set_default_curve()#设置非加密方式，默认secp256k1
@@ -41,7 +44,20 @@ class node():
         self.client = ipfshttpclient.connect(ipfs_api)#ipfs接口
         self.port=7001#数据帧接收端口
 
-        self.record={}#上传与接收文件
+        self.record={}
+        #json 文件加载
+        if os.path.exists("data.pkl"):
+            param=params.UmbralParameters(self.curve)
+            with open("data.pkl","rb") as f:
+                records=pickle.load(f)
+                for record in records:
+                    #record也许需要处理一下
+                    for key in record.keys():
+                        capsule=pre.Capsule.from_bytes(record[key],param)
+                        record[key]=capsule
+                        self.record.update(record)
+
+        print("Already get record:",self.record)
         self.tempo_cfrags={}#暂时接收来自其他节点的cfrag帧
         sock_ip_get = socket(AF_INET, SOCK_DGRAM)
         sock_ip_get.connect(('8.8.8.8', 80))
@@ -51,14 +67,40 @@ class node():
 
 
     def key_create(self):
-        self.key=fernet.Fernet.generate_key()#对称加密密钥
-        #创建节点非对称加密的私钥与公钥
-        self.pri_key=keys.UmbralPrivateKey.gen_key()
-        self.pub_key=self.pri_key.get_pubkey()
-        #创造数字签名用私钥与公钥
-        self.signing_key = keys.UmbralPrivateKey.gen_key()
-        self.verifying_key=self.signing_key.get_pubkey()
-        self.signer = signing.Signer(self.signing_key)
+        if not os.path.exists("key_pair.pkl"):
+            key_pair={}
+            self.key=fernet.Fernet.generate_key()#对称加密密钥
+            #创建节点非对称加密的私钥与公钥
+            self.pri_key=keys.UmbralPrivateKey.gen_key()
+            self.pub_key=self.pri_key.get_pubkey()
+            #创造数字签名用私钥与公钥
+            self.signing_key = keys.UmbralPrivateKey.gen_key()
+            self.verifying_key=self.signing_key.get_pubkey()
+            self.signer = signing.Signer(self.signing_key)
+            #保存,二值化处理
+            key_pair["key"]=self.key
+            key_pair["pri_key"]=self.pri_key.to_bytes()
+            key_pair["pub_key"]=self.pub_key.to_bytes()
+            key_pair["signing_key"]=self.signing_key.to_bytes()
+            key_pair["verifying_key"]=self.verifying_key.to_bytes()
+            with open("key_pair.pkl","wb") as f:
+                pickle.dump(key_pair,f)
+                print("the key pair has been saved")
+
+        else:
+            with open("key_pair.pkl","rb") as f:
+                key_pair=pickle.load(f)
+                pub_key=keys.UmbralPublicKey.from_bytes(key_pair["pub_key"])
+                verifying_key=keys.UmbralPublicKey.from_bytes(key_pair["verifying_key"])
+                pri_key=keys.UmbralPrivateKey.from_bytes(key_pair["pri_key"])
+                signing_key=keys.UmbralPrivateKey.from_bytes(key_pair["signing_key"])
+                self.key=key_pair["key"]
+                self.pri_key=pri_key
+                self.pub_key=pub_key
+                self.signing_key=signing_key
+                self.verifying_key=verifying_key
+                self.signer=signing.Signer(self.signing_key)
+                print("the key pair loads success")
 
 
 
@@ -148,12 +190,15 @@ class node():
                 elif obj.info["check"]==0:
                     #接收到初始请求
                     # capsule二值化
+                    print("received the request")
                     capsule=self.record[obj.info["tx_hash"]]
                     capsule=capsule.to_bytes()
                     # 自身公钥二值化
+                    print(capsule)
                     pub_key2=self.pub_key.to_bytes()
                     verify_key=self.verifying_key.to_bytes()
                     responce=info_packet(capsule=capsule,tx_hash=obj.info["tx_hash"],check=1,IP=self.IP,pub_key2=pub_key2,verify_key=verify_key)
+                    print(obj.info["IP"])
                     self.send(packet=responce,des_IP=obj.info["IP"])
 
                 elif obj.info["check"]==1:
@@ -171,7 +216,7 @@ class node():
                     self.record[obj.info["tx_hash"]]=capsule
                     pub_key=self.pub_key.to_bytes()
                     responce=info_packet(tx_hash=obj.info["tx_hash"],IP=self.IP,pub_key1=pub_key,check=2)
-                    self.send(packet=responce,des_port=obj.info["IP"])
+                    self.send(packet=responce,des_IP=obj.info["IP"])
 
 
 
@@ -264,7 +309,7 @@ class node():
         upload=" ".join(upload)#上链字符串数据
         print(upload)
         ciphertext,capsule=pre.encrypt(self.pub_key,bytes(upload,encoding="utf-8"))
-        print(ciphertext)
+        #print(ciphertext)
         #可能需要非对称加密
         upload_data=self.w3.toHex(ciphertext)
         txo = {}
@@ -278,11 +323,34 @@ class node():
         self.w3.eth.waitForTransactionReceipt(transaction_hash)
         self.w3.geth.miner.stop()
         print("成功上链")
-        #建立交易哈希与capsule的键值关系
-        self.record[transaction_hash]=capsule
-        print(type(transaction_hash))
-        #print(self.record[transaction_hash])
-        return transaction_hash
+        #建立交易哈希与capsule的键值关系,保存至json文件
+        #self.record[transaction_hash]=capsule
+        capsule=capsule.to_bytes()#capsule
+        #print(type(capsule))
+        #transaction_hash=transaction_hash.hex()
+        data={transaction_hash:capsule}
+        print(data)
+        if not os.path.exists("data.pkl"):
+            list=[]
+            with open("data.pkl","wb") as f:
+                list.append(data)
+                pickle.dump(list,f)
+        else:
+            fr=open("data.pkl","rb")
+            old_pickle=pickle.load(fr)
+            fr.close()
+            old_pickle.append(data)
+            with open("data.pkl","wb") as f:
+                pickle.dump(old_pickle,f)
+        data={"IP":self.IP,"tx_hash":transaction_hash.hex()}
+        responce=requests.post(url="http://10.134.205.182:8085/sendjson",json=data,verify=False)
+        if responce.status_code==200:
+            print("上传完毕")
+
+
+
+    
+        
 
 
 
@@ -309,15 +377,30 @@ class node():
 
 if __name__=="__main__":
     
-    eth_api="http://10.134.246.146:8545"
+    eth_api="http://10.134.205.182:8545"
     ipfs_api="/ip4/127.0.0.1/tcp/5001"
     node= node(eth_api, ipfs_api)
     node.key_create()
     print("开始文件传输测试")
+    print(node.pri_key)
+    print(node.pub_key)
+    print(type(node.key))
+    print(type(node.pub_key))
+
+    #t=threading.Thread(target=node.receive)
+    #t.start()
+    #node.file_encrypt_and_upload("test1.txt")
+    #node.file_encrypt_and_upload("test.txt") 
     
 
-    request=info_packet(tx_hash=tx_hash,check=0,IP=node.IP)#tx_hash是某个交易哈希
-    node.send(packet=request,des_IP="10.134.")#target IP
+    
+
+  
+
+
+    
+
+    
 
 
 
